@@ -1,5 +1,3 @@
-"use client";
-
 import NavBar from "../components/landing/NavBar";
 import Hero from "../components/landing/Hero";
 import Stats from "../components/landing/Stats";
@@ -10,10 +8,6 @@ import Testimonials from "../components/landing/Testimonials";
 import CTA from "../components/landing/CTA";
 import Footer from "../components/landing/Footer";
 
-export const metadata = {
-  title: "BitBima - Decentralized Health Insurance - Watch your health, guard your wealth.",
-  description: "Instant claims, lower costs, and transparent on-chain health insurance.",
-};
 
 const HomePage = () => {
   return (
