@@ -1,7 +1,12 @@
 import React from "react";
+import Layout from "../../components/Layout/Layout";
 
-const plans = () => {
-  return <div>plans</div>;
+const PlansPage = () => {
+  return (
+    <Layout>
+      <div>Plans</div>
+    </Layout>
+  );
 };
 
-export default plans;
+export default PlansPage;

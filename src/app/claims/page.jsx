@@ -1,7 +1,12 @@
 import React from "react";
+import Layout from "../../components/Layout/Layout";
 
-const claims = () => {
-  return <div>claims</div>;
+const ClaimsPage = () => {
+  return (
+    <Layout>
+      <div>Claims</div>
+    </Layout>
+  );
 };
 
-export default claims;
+export default ClaimsPage;

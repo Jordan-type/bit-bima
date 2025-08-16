@@ -1,7 +1,12 @@
 import React from "react";
+import Layout from "../../components/Layout/Layout";
 
-const analytics = () => {
-  return <div>analytics</div>;
+const AnalyticsPage = () => {
+  return (
+    <Layout>
+      <div>Analytics</div>
+    </Layout>
+  );
 };
 
-export default analytics;
+export default AnalyticsPage;

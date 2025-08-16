@@ -1,6 +1,6 @@
 import { Fragment } from "react";
 import Link from "next/link";
-import { useRouter } from "next/router";
+import { useRouter } from "next/navigation";
 import { Dialog, Transition } from "@headlessui/react";
 import {
   FiHome,
@@ -72,10 +72,10 @@ const Sidebar = ({ open, setOpen }) => {
 
           <div>
             <h1 className="text-xl font-bold text-white tracking-wide">
-              HealthCare
-              <span className="text-cyan-400 ml-1">Chain</span>
+              Bit
+              <span className="text-cyan-400 ml-1">Bima</span>
             </h1>
-            <p className="text-sm text-blue-200 font-medium">Insurance DApp</p>
+            <p className="text-sm text-blue-200 font-medium">Insurance</p>
           </div>
         </div>
       </div>
