@@ -1,3 +1,5 @@
+"use client"
+
 import { ConnectButton } from "@rainbow-me/rainbowkit";
 import { FiMenu, FiBell, FiGlobe, FiShield, FiZap } from "react-icons/fi";
 import { NETWORK_NAME } from "../../config/network";

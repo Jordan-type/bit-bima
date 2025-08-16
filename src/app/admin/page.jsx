@@ -1,10 +1,9 @@
 "use client"
 
 import { useState, useEffect } from "react";
-import { useAccount } from "wagmi";
 import Layout from "../../components/Layout/Layout";
 
-const admin = () => {
+const AdminPage = () => {
   return (
     <Layout>
       <div>Admin Page</div>
@@ -12,4 +11,4 @@ const admin = () => {
   );
 };
 
-export default admin;
+export default AdminPage;
