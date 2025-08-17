@@ -1,7 +1,7 @@
 // src/config/network.js
 import { getDefaultConfig } from "@rainbow-me/rainbowkit";
 import { http, createStorage, cookieStorage } from "wagmi";
-import { celo, celoSepolia, holesky, localhost } from "wagmi/chains";
+import { celo, celoAlfajores, celoSepolia, holesky, localhost } from "wagmi/chains";
 
 // WalletConnect Cloud Project ID
 const projectId = process.env.NEXT_PUBLIC_WALLET_CONNECT_PROJECT_ID || "REPLACE_ME";
@@ -14,7 +14,7 @@ export const CHAINS = [localhost, celo, celoSepolia, holesky];
 
 // Single source of truth for wagmi config
 export const wagmiConfig = getDefaultConfig({
-  appName: process.env.NEXT_PUBLIC_APP_NAME || "BitBima Dapp",
+  appName: process.env.NEXT_PUBLIC_APP_NAME || "Bit Bima Dapp",
   projectId,
   chains: CHAINS,
   transports: {
