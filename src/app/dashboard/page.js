@@ -27,12 +27,13 @@ export default function Dashboard() {
 
     return (
         <Layout>
-            <StatsCards />
-            <RecentActivity />
-            <QuickActions />
-            <PolicyOverview />
-            <ClaimsOverview />
+            <div className="space-y-8">
+                <StatsCards />
+                <RecentActivity />
+                <QuickActions />
+                <PolicyOverview />
+                <ClaimsOverview />
+            </div>
         </Layout>
     );
 }
-
