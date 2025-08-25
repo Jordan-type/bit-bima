@@ -1,0 +1,31 @@
+const PLAN_TYPES = {
+  BASIC: 0,
+  PREMIUM: 1,
+  PLATINUM: 2,
+};
+
+const PAYMENT_TYPES = {
+  ONE_TIME: 0,
+  MONTHLY: 1,
+};
+
+const POLICY_STATUS = {
+  ACTIVE: 0,
+  EXPIRED: 1,
+  CANCELLED: 2,
+  SUSPENDED: 3,
+};
+
+const CLAIM_STATUS = {
+  PENDING: 0,
+  APPROVED: 1,
+  REJECTED: 2,
+  PAID: 3,
+};
+
+export {
+  PLAN_TYPES,
+  PAYMENT_TYPES,
+  POLICY_STATUS,
+  CLAIM_STATUS
+}

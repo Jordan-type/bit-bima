@@ -1,3 +1,5 @@
+"use client";
+
 import { providers } from "ethers";
 import { useMemo } from "react";
 import { useClient, useConnectorClient } from "wagmi";
