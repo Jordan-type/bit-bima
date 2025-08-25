@@ -1,6 +1,6 @@
 import { Fragment } from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { useRouter, usePathname } from "next/navigation";
 import { Dialog, Transition } from "@headlessui/react";
 import {
   FiHome,
@@ -19,6 +19,17 @@ import {
 import { GiHeartOrgan } from "react-icons/gi";
 import { MdAdminPanelSettings } from "react-icons/md";
 
+
+
+type SidebarProps = {
+  open: boolean;
+  setOpen: React.Dispatch<React.SetStateAction<boolean>>;
+};
+
+function classNames(...classes: Array<string | false | null | undefined>) {
+  return classes.filter((c): c is string => Boolean(c)).join(" ");
+}
+
 const navigation = [
   { name: "Dashboard", href: "/dashboard", icon: FiHome },
   { name: "Insurance Plans", href: "/plans", icon: FiShield },
@@ -28,11 +39,8 @@ const navigation = [
   { name: "Admin", href: "/admin", icon: MdAdminPanelSettings },
 ];
 
-function classNames(...classes) {
-  return classes.filter(Boolean).join(" ");
-}
-
-const Sidebar = ({ open, setOpen }) => {
+const Sidebar = ({ open, setOpen }: SidebarProps) => {
+  const pathname = usePathname();
   const router = useRouter();
 
   const SidebarContent = () => (
@@ -85,7 +93,7 @@ const Sidebar = ({ open, setOpen }) => {
           <li>
             <ul role="list" className="-mx-2 space-y-2">
               {navigation.map((item) => {
-                const isActive = router.pathname === item.href;
+                const isActive = pathname === item.href;
                 return (
                   <li key={item.name}>
                     <Link

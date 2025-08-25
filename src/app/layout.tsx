@@ -1,6 +1,8 @@
 import "./globals.css";
+import { ReactNode } from "react";
 import { Inter } from "next/font/google";
-import Providers from "../provider/providers";
+import { RainbowKitProvider, darkTheme, lightTheme  } from '@rainbow-me/rainbowkit';
+import Providers from "@/provider/providers";
 
 const inter = Inter({ subsets: ["latin"] });
 
@@ -10,7 +12,7 @@ export const metadata = {
   description: "Instant claims, lower costs, and transparent on-chain health insurance.",
 };
 
-export default function RootLayout({ children }) {
+export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html lang="en">
       <body className={inter.className}>

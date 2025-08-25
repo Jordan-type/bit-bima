@@ -2,7 +2,8 @@
 
 import React, { useState, useEffect, useMemo }  from "react";
 import { useSearchParams } from "next/navigation";
-import { useAccount } from "wagmi";
+import { useAccount, usePublicClient } from "wagmi";
+import { formatEther } from "viem";
 import {
   FiRefreshCw,
   FiFileText,
@@ -14,66 +15,71 @@ import {
   FiActivity,
   FiTrendingUp,
 } from "react-icons/fi";
-import { useEthersProvider, useEthersSigner } from "../../hooks/ethers";
-import ClaimCard from "../../components/Claims/ClaimCard";
-import SubmitClaimModal from "../../components/Claims/SubmitClaimModal";
-import ProcessClaimModal from "../../components/Claims/ProcessClaimModal";
-import Layout from "../../components/Layout/Layout";
+
+import ClaimCard from "@/components/Claims/ClaimCard";
+import SubmitClaimModal from "@/components/Claims/SubmitClaimModal";
+import ProcessClaimModal from "@/components/Claims/ProcessClaimModal";
+import Layout from "@/components/Layout/Layout";
 import { contractService } from "@/services/contract"; 
 import { CLAIM_STATUS } from "@/constant";
+import type { Address } from "viem";
+import type { Claim, Policy } from "@/services/contract";
+import { toEthStr, tsToDateStr, celoscanBase, celoscanAddress, fmt, toTokenStr } from "@/utils/web3";
 
 const ClaimsPage = () => {
   const searchParams = useSearchParams();
   const initialPolicyId = searchParams.get("policyId") || "";
 
   const { address, isConnected } = useAccount();
-  const chainId = useAccount().chain?.id || 1; // Default to mainnet if no chainId
-  const provider = useEthersProvider();
-  const signer = useEthersSigner();
+  const publicClient = usePublicClient();
 
   const [loading, setLoading] = useState(true);
-  const [claims, setClaims] = useState([]);
-  const [policies, setPolicies] = useState([]);
-  const [selectedPolicy, setSelectedPolicy] = useState(initialPolicyId);
-  const [statusFilter, setStatusFilter] = useState("");
+  const [claims, setClaims] = useState<Claim[]>([]);
+  const [policies, setPolicies] = useState<Policy[]>([]);
+  const [selectedPolicy, setSelectedPolicy] = useState<string>(initialPolicyId);
+  const [statusFilter, setStatusFilter] = useState<string>("");
   const [submitClaimModalOpen, setSubmitClaimModalOpen] = useState(false);
   const [processClaimModalOpen, setProcessClaimModalOpen] = useState(false);
-  const [selectedClaim, setSelectedClaim] = useState(null);
+  const [selectedClaim, setSelectedClaim] = useState<Claim | null>(null);
 
 
-  // keep contract addresses aligned with the connected chain
+  // Align contract service with chain (optional safety)
   useEffect(() => {
-    if (chainId) contractService.setChainId(chainId);
-  }, [chainId]);
+    if (publicClient?.chain?.id) contractService.setChainId(publicClient.chain.id);
+  }, [publicClient?.chain?.id]);
 
   // initial + refresh load
   useEffect(() => {
-    if (isConnected && provider && address) {
-      loadData();
-    }
+    if (isConnected && publicClient && address) void loadData();
+    else setLoading(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isConnected, provider, address]);
+  }, [isConnected, publicClient, address]);
 
-    // prefer query param policyId on first render (if it exists after policies load)
+  // prefer query param policyId on first render (if it exists after policies load)
   useEffect(() => {
     if (initialPolicyId && policies?.length) {
       setSelectedPolicy(initialPolicyId);
     }
   }, [initialPolicyId, policies]);
 
-  const loadData = async () => {
+const loadData = async () => {
     try {
       setLoading(true);
 
-      // 1) fetch user's policies
-      const userPolicies = await contractService.getUserPolicies(address, provider);
+      if (!publicClient || !address) return;
 
-      // Augment policies with remaining coverage (optional)
+      // 1) fetch user's policies
+      const userPolicies = await contractService.getUserPolicies(
+        address as Address,
+        publicClient
+      );
+
+      // enrich with remainingCoverage (wei -> string ETH)
       const enriched = await Promise.all(
         userPolicies.map(async (p) => {
           try {
-            const remaining = await contractService.getRemainingCoverage(p.policyId, provider);
-            return { ...p, remainingCoverage: remaining };
+            const remainingWei = await contractService.getRemainingCoverage(p.policyId, publicClient);
+            return { ...p, remainingCoverage: formatEther(remainingWei) };
           } catch {
             return p;
           }
@@ -82,15 +88,15 @@ const ClaimsPage = () => {
       setPolicies(enriched);
 
       // 2) fetch claims for each policy
-      let allClaims = [];
+      let allClaims: Claim[] = [];
       for (const policy of userPolicies) {
-        const policyClaims = await contractService.getPolicyClaims(policy.policyId, provider);
+        const policyClaims = await contractService.getPolicyClaims(policy.policyId, publicClient);
         allClaims = allClaims.concat(policyClaims || []);
       }
 
-      // newest first by submissionDate (contract returns seconds)
+      // newest first
       allClaims.sort(
-        (a, b) => parseInt(b.submissionDate || "0", 10) - parseInt(a.submissionDate || "0", 10)
+        (a, b) => Number(b.submissionDate ?? 0n) - Number(a.submissionDate ?? 0n)
       );
 
       setClaims(allClaims);
@@ -110,11 +116,10 @@ const ClaimsPage = () => {
     if (statusFilter !== "") {
       out = out.filter((c) => String(c.status) === String(statusFilter));
     }
-
     return out;
   }, [claims, selectedPolicy, statusFilter]);
 
-  const handleProcessClaim = (claim) => {
+  const handleProcessClaim = (claim: Claim) => {
     setSelectedClaim(claim);
     setProcessClaimModalOpen(true);
   };
@@ -126,10 +131,12 @@ const ClaimsPage = () => {
       (c) => c.status === CLAIM_STATUS.APPROVED || c.status === CLAIM_STATUS.PAID
     ).length;
     const rejected = claims.filter((c) => c.status === CLAIM_STATUS.REJECTED).length;
-    const totalAmount = claims.reduce((sum, c) => sum + parseFloat(c.claimAmount || "0"), 0);
+
+    // sums in ETH
+    const totalAmount = claims.reduce((sum, c) => sum + Number(formatEther(c.claimAmount ?? 0n)), 0);
     const approvedAmount = claims.reduce((sum, c) => {
       if (c.status === CLAIM_STATUS.APPROVED || c.status === CLAIM_STATUS.PAID) {
-        return sum + parseFloat(c.approvedAmount || "0");
+        return sum + Number(formatEther(c.approvedAmount ?? 0n));
       }
       return sum;
     }, 0);
@@ -252,8 +259,8 @@ const ClaimsPage = () => {
                   >
                     <option value="">All Policies</option>
                     {policies.map((p) => (
-                      <option key={p.policyId} value={p.policyId}>
-                        Policy #{p.policyId}
+                      <option key={String(p.policyId)} value={String(p.policyId)}>
+                        Policy #{String(p.policyId)}
                       </option>
                     ))}
                   </select>
@@ -326,7 +333,13 @@ const ClaimsPage = () => {
 
 /* ---------------- small UI helpers ---------------- */
 
-function StatCard({ icon, title, value, gradient = "from-blue-500/5 to-cyan-500/5", pulse = false }) {
+function StatCard({ icon, title, value, gradient = "from-blue-500/5 to-cyan-500/5", pulse = false }: {
+  icon?: React.ReactNode;
+  title: string;
+  value: React.ReactNode;
+  gradient?: string;
+  pulse?: boolean;
+}) {
   return (
     <div className="relative bg-white/80 backdrop-blur-xl border border-white/50 shadow-xl rounded-2xl overflow-hidden group hover:shadow-2xl transition-all duration-300">
       <div className={`absolute inset-0 bg-gradient-to-br ${gradient}`} />
@@ -372,7 +385,7 @@ function SkeletonList() {
   );
 }
 
-function EmptyState({ hasAny, onAdd }) {
+function EmptyState({ hasAny, onAdd }: { hasAny: boolean; onAdd: () => void }) {
   return (
     <div className="relative">
       <div className="absolute inset-0 overflow-hidden rounded-2xl">

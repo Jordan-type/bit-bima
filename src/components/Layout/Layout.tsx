@@ -5,7 +5,9 @@ import Sidebar from "./Sidebar";
 import Header from "./Header";
 import { Toaster } from "react-hot-toast";
 
-const Layout = ({ children }) => {
+type LayoutProps = { children: React.ReactNode };
+
+const Layout: React.FC<LayoutProps> = ({ children }) => {
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
   return (

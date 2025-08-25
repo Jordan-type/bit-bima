@@ -1,60 +1,59 @@
 "use client"
 
-import { useState, useEffect } from "react";
-import { useAccount, useChainId } from "wagmi";
-import { useEthersProvider, useEthersSigner } from "../../hooks/ethers";
-import Layout from "../../components/Layout/Layout";
-import PlanCard from "../../components/Plans/PlanCard";
-import PurchaseModal from "../../components/Plans/PurchaseModal";
-import { contractService,  } from "../../services/contract";
-import { PLAN_TYPES } from "../../constant/index";
-import { FiShield, FiCheck, FiZap, FiLock, FiGlobe, FiSmartphone, FiClock, FiTrendingUp, FiStar, FiAward, FiCrown, FiHeart, FiCreditCard, FiBarChart, } from "react-icons/fi";
+import { useEffect, useState, useCallback } from "react";
+import type { Address } from "viem";
+import { useAccount, useChainId, usePublicClient, useWalletClient  } from "wagmi";
+import { FiShield, FiCheck, FiZap, FiLock, FiGlobe, FiSmartphone, FiClock, FiTrendingUp, FiStar, FiAward, FiHeart, FiCreditCard, FiBarChart, } from "react-icons/fi";
+import Layout from "@/components/Layout/Layout";
+import PlanCard from "@/components/Plans/PlanCard";
+import PurchaseModal from "@/components/Plans/PurchaseModal";
+import { PLAN_TYPES } from "@/constant/index";
+import { contractService } from "@/services/contract";
+import type { Plan } from "@/types/app";
+import { toEthStr, tsToDateStr, celoscanBase, celoscanAddress, fmt, toTokenStr } from "@/utils/web3";
+import ConnectGate from "@/components/common/ConnectGate";
+
 
 export default function InsurancePlans() {
   const { isConnected } = useAccount();
   const chainId = useChainId();
-  const provider = useEthersProvider();
-  const signer = useEthersSigner();
+  const publicClient = usePublicClient();
+  const { data: walletClient } = useWalletClient(); // available for writes if/when needed
 
   const [loading, setLoading] = useState(true);
-  const [plans, setPlans] = useState([]);
-  const [selectedPlan, setSelectedPlan] = useState(null);
+  const [plans, setPlans] = useState<Plan[]>([]);
+  const [selectedPlan, setSelectedPlan] = useState<Plan | null>(null);
   const [purchaseModalOpen, setPurchaseModalOpen] = useState(false);
-  const [netErr, setNetErr] = useState(null);
+  const [netErr, setNetErr] = useState<string | null>(null);
 
-useEffect(() => {
-    let cancelled = false;
+ const loadPlans = useCallback(async () => {
+    try {
+      setNetErr(null);
+      if (!publicClient) return;
 
-    (async () => {
-      try {
-        setNetErr(null);
-        if (!provider) return;
+      // point the service to correct addresses for this chain
+      contractService.setChainId(chainId);
 
-        // ensure provider knows the network
-        const net = await provider.getNetwork?.();
-        const detectedId = Number((net && net.chainId) || chainId || 0);
-        if (!detectedId) throw new Error("Wallet/provider not connected to a network");
+      setLoading(true);
+      const list = await contractService.getAllInsurancePlans(publicClient);
+      setPlans(list);
+    } catch (e: any) {
+      console.error("loadPlans:", e);
+      setNetErr(e?.message || "Failed to load plans");
+    } finally {
+      setLoading(false);
+    }
+  }, [publicClient, chainId]);
 
-        // point the service to correct addresses for this chain
-        contractService.setChainId(detectedId);
+  useEffect(() => {
+    if (isConnected && publicClient) {
+      loadPlans();
+    } else {
+      setLoading(false);
+    }
+  }, [isConnected, publicClient, loadPlans]);
 
-        setLoading(true);
-        const list = await contractService.getAllInsurancePlans(provider);
-        if (!cancelled) setPlans(list);
-      } catch (e) {
-        console.error("loadPlans:", e);
-        if (!cancelled) setNetErr(e?.message || "Failed to load plans");
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    })();
-
-    return () => { cancelled = true; };
-  }, [provider, chainId]);
-
-
-
-  const handlePurchase = (plan) => {
+  const handlePurchase = (plan: Plan) => {
     if (!isConnected) {
       alert("Please connect your wallet first");
       return;

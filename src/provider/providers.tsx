@@ -26,7 +26,13 @@ import { wagmiConfig } from "../config/network";
 
 const queryClient = new QueryClient();
 
-export default function Providers({ children }) {
+import React, { ReactNode } from "react";
+
+interface ProvidersProps {
+  children: ReactNode;
+}
+
+export default function Providers({ children }: ProvidersProps) {
   return (
     <WagmiProvider config={wagmiConfig}>
       <QueryClientProvider client={queryClient}>

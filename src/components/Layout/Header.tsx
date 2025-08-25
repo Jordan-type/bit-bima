@@ -4,7 +4,11 @@ import { ConnectButton } from "@rainbow-me/rainbowkit";
 import { FiMenu, FiBell, FiGlobe, FiShield, FiZap } from "react-icons/fi";
 import { NETWORK_NAME } from "../../config/network";
 
-const Header = ({ setSidebarOpen }) => {
+type HeaderProps = {
+  setSidebarOpen: React.Dispatch<React.SetStateAction<boolean>>;
+};
+
+const Header: React.FC<HeaderProps> = ({ setSidebarOpen }) => {
   return (
     <div className="sticky top-0 z-40 flex h-16 shrink-0 items-center gap-x-4 border-b border-gray-200/50 bg-white/80 backdrop-blur-xl px-4 shadow-lg shadow-blue-500/5 sm:gap-x-6 sm:px-6 lg:px-8">
       {/* Gradient overlay for depth */}

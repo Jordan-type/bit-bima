@@ -1,12 +1,12 @@
-import NavBar from "../components/landing/NavBar";
-import Hero from "../components/landing/Hero";
-import Stats from "../components/landing/Stats";
-import Features from "../components/landing/Features";
-import HowItWorks from "../components/landing/HowItWorks";
-import Plans from "../components/landing/Plans";
-import Testimonials from "../components/landing/Testimonials";
-import CTA from "../components/landing/CTA";
-import Footer from "../components/landing/Footer";
+import NavBar from "@/components/landing/NavBar";
+import Hero from "@/components/landing/Hero";
+import Stats from "@/components/landing/Stats";
+import Features from "@/components/landing/Features";
+import HowItWorks from "@/components/landing/HowItWorks";
+import Plans from "@/components/landing/Plans";
+import Testimonials from "@/components/landing/Testimonials";
+import CTA from "@/components/landing/CTA";
+import Footer from "@/components/landing/Footer";
 
 
 const HomePage = () => {

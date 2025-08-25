@@ -1,618 +1,993 @@
-import { ethers } from "ethers";
-import toast from "react-hot-toast";
-import {
-  ClaimManager as ABI_CLAIM,
-  PolicyManager as ABI_PM,
-  RiskPoolTreasury as ABI_POOL,
-  CoreProtocol as ABI_CORE,
-  MockERC20 as ABI_ERC20,
-} from "../contractsABI/abis";
-import {
-  CONTRACT_ADDRESS,          // default/fallback set
-  getContractAddresses,      // picks per-chain
-} from "../config/network";
-import { PLAN_TYPES, PAYMENT_TYPES, POLICY_STATUS, CLAIM_STATUS } from "@/constant";
+/* eslint-disable @typescript-eslint/no-explicit-any */
+import type { ContractFunctionName } from "viem";
+import { erc20Abi, formatEther, parseEther, Abi, Address, PublicClient, WalletClient, decodeEventLog, parseAbiItem  } from "viem";
+import { CONTRACT_ADDRESSES } from "@/config/network";
+import PolicyABI from "@/contractsABI/PolicyManager.json";
+import ClaimABI from "@/contractsABI/ClaimManager.json";
+import RiskPoolABI from "@/contractsABI/RiskPoolTreasury.json";
+import type { Plan } from "@/types/app";
 
-/* ------------------------- ethers v5/v6 helpers ------------------------- */
-const isV6 = !!ethers.formatEther;
-const fmt   = (x) => (isV6 ? ethers.formatEther(x) : ethers.utils.formatEther(x));
-const parse = (x) => (isV6 ? ethers.parseEther(String(x)) : ethers.utils.parseEther(String(x)));
-const isAddr = (a) => (ethers.utils?.isAddress ? ethers.utils.isAddress(a) : ethers.isAddress(a));
+/** --------------------------
+ *  Types that mirror your ABIs
+ *  -------------------------- */
+export type Policy = {
+  policyId: bigint;
+  policyholder: Address;
+  planType: number;
+  paymentType: number;
+  paymentToken: Address;
+  coverageAmount: bigint;
+  deductible: bigint;
+  premium: bigint;
+  startDate: bigint;
+  endDate: bigint;
+  lastPaymentDate: bigint;
+  status: number;
+  ipfsMetadata: string;
+  totalPaid: bigint;
+  claimsUsed: bigint;
+};
 
-/* --------------------------- address guardrail -------------------------- */
-function need(addr, name) {
-  if (!addr || !isAddr(addr)) throw new Error(`${name} address missing/invalid`);
-  return addr;
+export type Claim = {
+  claimId: bigint;
+  policyId: bigint;
+  claimant: Address;
+  claimAmount: bigint;
+  approvedAmount: bigint;
+  status: number;          // enum
+  submissionDate: bigint;
+  processedDate: bigint;
+  ipfsDocuments: string;
+  description: string;
+};
+
+export type ContractStats = {
+  totalPolicies: bigint;
+  totalClaims: bigint;
+  /** RiskPool token balance for the provided token (see getContractStats param) */
+  contractBalance: bigint;  // RiskPool balance for PremiumToken (or the token you pass)
+};
+
+/** --------------------------
+ *  Internal helpers
+ *  -------------------------- */
+
+const addrs = (chainId: number) => {
+  const a = (CONTRACT_ADDRESSES as any)[chainId];
+  if (!a) throw new Error(`No addresses configured for chain ${chainId}`);
+  return a as {
+    PolicyManager: Address;
+    ClaimManager: Address;
+    RiskPool: Address;
+    /** Optional – if you keep a default premium token in config */
+    PremiumToken?: Address;
+  };
+};
+
+const _asNumber = (x: any) => Number(x ?? 0);
+
+function _requireClients(
+  walletClient?: WalletClient | null,
+  publicClient?: PublicClient | null
+): asserts walletClient is WalletClient & { account: { address: Address } } {
+  if (!walletClient?.account) throw new Error("Wallet client not available");
+  if (!publicClient?.chain) throw new Error("Chain not available");
 }
 
-/* ---------------------------- service class ----------------------------- */
-class ContractService {
-  constructor() {
-    // start with whatever CONTRACT_ADDRESS exported (your default chain)
-    this.addresses = CONTRACT_ADDRESS || {};
+/** --------------------------
+ *  Service implementation
+ *  -------------------------- */
+
+let _chainIdOverride: number | null = null;
+
+/** Kept for compatibility with your pages. viem gets chain from the PublicClient, so this is optional. */
+function setChainId(id: number) {
+  _chainIdOverride = id;
+}
+
+function _chainId(pc: PublicClient) {
+  return _chainIdOverride ?? pc.chain?.id ?? 0;
+}
+
+// Get token metadata (address, symbol, decimals)
+async function getTokenMeta(
+  pc: PublicClient,
+  token?: Address
+): Promise<{ address?: Address; symbol: string; decimals: number }> {
+  const chainId = pc.chain?.id ?? 0;
+  const cfg = (CONTRACT_ADDRESSES as any)[chainId] || {};
+  const addr: Address | undefined = token ?? cfg.PremiumToken;
+  const cfgSymbol = cfg.TokenSymbol as string | undefined;
+  const cfgDecimals = cfg.TokenDecimals as number | undefined;
+
+  // If fully specified in config, use it
+  if (addr && cfgSymbol && typeof cfgDecimals === "number") {
+    return { address: addr, symbol: cfgSymbol, decimals: cfgDecimals };
   }
 
-  /** Update internal addresses using current chainId (e.g. from wagmi's useChainId) */
-  setChainId(chainId) {
-    this.addresses = getContractAddresses(chainId);
+  // If token address exists but meta missing, read from chain
+  if (pc && addr) {
+    const [decimals, symbol] = await pc.multicall({
+      allowFailure: false,
+      contracts: [
+        { address: addr, abi: erc20Abi, functionName: "decimals" },
+        { address: addr, abi: erc20Abi, functionName: "symbol" },
+      ],
+    });
+    return { address: addr, symbol, decimals };
   }
 
-  /** Manually replace addresses (useful for tests) */
-  setAddresses(addresses) {
-    this.addresses = addresses || {};
-  }
+  // Fallback when nothing configured (prevents InvalidAddressError)
+  return { address: undefined, symbol: cfgSymbol ?? "TOKEN", decimals: cfgDecimals ?? 18 };
+}
 
-  _getAddresses() {
-    const a = this.addresses || {};
-    // light validation to give nice errors early
-    need(a.PolicyManager, "PolicyManager");
-    need(a.ClaimManager, "ClaimManager");
-    need(a.RiskPoolTreasury, "RiskPoolTreasury");
-    need(a.CoreProtocol, "CoreProtocol");
-    return a;
-  }
+async function isOwner(pc: PublicClient, user: Address): Promise<boolean> {
+  const a = addrs(_chainId(pc));
+  const owner = await pc.readContract({
+    address: a.PolicyManager,
+    abi: PolicyABI.abi as any,
+    functionName: "owner",
+    args: [],
+  }) as Address;
+  return owner.toLowerCase() === user.toLowerCase();
+}
 
-  /* Create read or write instances on demand */
-  _getInstances(signerOrProvider, withSigner = false) {
-    if (withSigner && !ethers.Signer?.isSigner?.(signerOrProvider)) {
-      throw new Error("Expected a Signer for write operation");
-    }
-    const addr = this._getAddresses();
-    const pm   = new ethers.Contract(addr.PolicyManager,    ABI_PM,    signerOrProvider);
-    const cm   = new ethers.Contract(addr.ClaimManager,     ABI_CLAIM, signerOrProvider);
-    const pool = new ethers.Contract(addr.RiskPoolTreasury, ABI_POOL,  signerOrProvider);
-    const core = new ethers.Contract(addr.CoreProtocol,     ABI_CORE,  signerOrProvider);
-    return { pm, cm, pool, core };
-  }
+async function isAuthorizedDoctor(pc: PublicClient, user: Address): Promise<boolean> {
+  const a = addrs(_chainId(pc));
+  return await pc.readContract({
+    address: a.ClaimManager,
+    abi: ClaimABI.abi as any,
+    functionName: "authorizedDoctors",
+    args: [user],
+  }) as boolean;
+}
 
-  
+/** Single plan */
+async function getInsurancePlan(
+  pc: PublicClient | null | undefined,
+  index: number
+): Promise<Plan> {
+  if (!pc) throw new Error("Public client not ready");
+  const chainId = _chainIdOverride ?? pc.chain?.id ?? 0;
+  const a = addrs(chainId);
 
-  /* ------------------------------ READS --------------------------------- */
+  const r = (await pc.readContract({
+    address: a.PolicyManager,
+    abi: PolicyABI.abi as any,
+    functionName: "insurancePlans",
+    args: [BigInt(index)],
+  })) as any;
 
-// inside ContractService class (keep the rest of your file as-is)
-
-/* ---------- normalize a plan tuple/struct ---------- */
-_readPlanTuple(planType, p) {
+  // PolicyManager.InsurancePlan:
+  // oneTimePrice, monthlyPrice, coverageAmount, deductible, ipfsHash, isActive
   return {
-    planType: Number(p?.planType ?? p?.[0] ?? planType),
-    oneTimePrice: fmt(p?.oneTimePrice ?? p?.[1] ?? "0"),
-    monthlyPrice: fmt(p?.monthlyPrice ?? p?.[2] ?? "0"),
-    coverageAmount: fmt(p?.coverageAmount ?? p?.[3] ?? "0"),
-    deductible: fmt(p?.deductible ?? p?.[4] ?? "0"),
-    ipfsHash: (p?.ipfsHash ?? p?.[5] ?? "") || "",
-    isActive: Boolean(p?.isActive ?? p?.[6] ?? true),
+    planType: index,
+    oneTimePrice: BigInt(r.oneTimePrice ?? r[0]),
+    monthlyPrice: BigInt(r.monthlyPrice ?? r[1]),
+    coverageAmount: BigInt(r.coverageAmount ?? r[2]),
+    deductible: BigInt(r.deductible ?? r[3]),
+    ipfsHash: String(r.ipfsHash ?? r[4]),
+    isActive: Boolean(r.isActive ?? r[5]),
   };
 }
 
-/* ---------- flexible plan getter (works with new/old ABIs) ---------- */
-async getInsurancePlan(planType, provider) {
-  try {
-    const { pm } = this._getInstances(provider);
+/** Read N plans (default 3: 0,1,2). If you add more plans later, pass a bigger `count`. */
+async function getAllInsurancePlans(
+  pc: PublicClient | null | undefined,
+  count = 3
+): Promise<Plan[]> {
+  if (!pc) throw new Error("Public client not ready");
+  const chainId = _chainIdOverride ?? pc.chain?.id ?? 0;
+  const a = addrs(chainId);
 
-    // Try a wide set of common names
-    const baseNames = [
-      "getplan",
-      "getinsuranceplan",
-      "plans",
-      "insuranceplans",
-      "planconfigs",
-      "getplanconfig",
-      "planinfo",
-      "getplandetails",
-      "plandetails",
-    ];
+  const indexes = Array.from({ length: count }, (_, i) => BigInt(i));
+  const res = await pc.multicall({
+    allowFailure: false,
+    contracts: indexes.map((i) => ({
+      address: a.PolicyManager,
+      abi: PolicyABI.abi as any,
+      functionName: "insurancePlans",
+      args: [i],
+    })),
+  });
 
-    // Build exact signatures from ABI (handles uint8/uint256 overloads)
-    const keys = this._findGetterKeys(pm, baseNames);
+  console.log(
+    `Fetched insurance plans (count: ${count}):`,
+    res
+  )
 
-    // Also try the plain method names (ethers adds these when *not* overloaded)
-    const plainNames = [...new Set(baseNames.map(n => n.replace(/^get/, "")))];
-    const direct = [...new Set([
-      ...keys,
-      ...baseNames,
-      ...plainNames,
-    ])];
+  return res.map((r: any) => ({
+    planType: _asNumber(r.planType ?? r[0]),
+    oneTimePrice: BigInt(r.oneTimePrice ?? r[1]),
+    monthlyPrice: BigInt(r.monthlyPrice ?? r[2]),
+    coverageAmount: BigInt(r.coverageAmount ?? r[3]),
+    deductible: BigInt(r.deductible ?? r[4]),
+    ipfsHash: String(r.ipfsHash ?? r[5]),
+    isActive: Boolean(r.isActive ?? r[6]),
+  }));
+}
 
-    for (const key of direct) {
-      if (!pm[key]) continue; // not in ABI
-      try {
-        const p = await pm[key](planType);
-        if (p != null) return this._readPlanTuple(planType, p);
-      } catch (e) {
-        // try next candidate
-      }
-    }
+/** Mapping getter (public) */
+async function isTokenAccepted(
+  token: Address,
+  pc: PublicClient | null | undefined
+): Promise<boolean> {
+  if (!pc) throw new Error("Public client not ready");
+  const chainId = _chainIdOverride ?? pc.chain?.id ?? 0;
+  const a = addrs(chainId);
+  const ok = (await pc.readContract({
+    address: a.PolicyManager,
+    abi: PolicyABI.abi as any,
+    functionName: "acceptedTokens",
+    args: [token],
+  })) as boolean;
+  return ok;
+}
 
-    // Nothing worked — surface what the ABI actually has to help you adjust ABIs quickly
-    console.log(
-      "PolicyManager plan getter not found. ABI has:",
-      this._listFunctionSigs(pm)
-    );
-    throw new Error("No compatible plan getter found on PolicyManager");
-  } catch (e) {
-    console.log("getInsurancePlan:", e);
-    return null;
+/** One policy */
+async function getPolicy(
+  policyId: bigint,
+  pc: PublicClient | null | undefined
+): Promise<Policy> {
+  if (!pc) throw new Error("Public client not ready");
+  const chainId = _chainIdOverride ?? pc.chain?.id ?? 0;
+  const a = addrs(chainId);
+
+  const r = (await pc.readContract({
+    address: a.PolicyManager,
+    abi: PolicyABI.abi as any,
+    functionName: "policies",
+    args: [policyId],
+  })) as any;
+
+  console.log(
+    `Fetched policy ${policyId}:`,
+    r
+  )
+
+  return {
+    policyId,
+    policyholder: (r.policyholder ?? r[0]) as Address,
+    planType: _asNumber(r.planType ?? r[1]),
+    paymentType: _asNumber(r.paymentType ?? r[2]),
+    paymentToken: (r.paymentToken ?? r[3]) as Address,
+    coverageAmount: BigInt(r.coverageAmount ?? r[4]),
+    deductible: BigInt(r.deductible ?? r[5]),
+    premium: BigInt(r.premium ?? r[6]),
+    startDate: BigInt(r.startDate ?? r[7]),
+    endDate: BigInt(r.endDate ?? r[8]),
+    lastPaymentDate: BigInt(r.lastPaymentDate ?? r[9]),
+    status: _asNumber(r.status ?? r[10]),
+    ipfsMetadata: String(r.ipfsMetadata ?? r[11]),
+    totalPaid: BigInt(r.totalPaid ?? r[12]),
+    claimsUsed: BigInt(r.claimsUsed ?? r[13]),
+  };
+}
+
+/** Fetch all policy IDs for a user then hydrate each policy struct. */
+async function getUserPolicies(
+  user: Address,
+  pc: PublicClient | null | undefined
+): Promise<Policy[]> {
+  if (!pc) throw new Error("Public client not ready");
+  const chainId = _chainIdOverride ?? pc.chain?.id ?? 0;
+  const a = addrs(chainId);
+
+  const ids = (await pc.readContract({
+    address: a.PolicyManager,
+    abi: PolicyABI.abi as any,
+    functionName: "getUserPolicies",
+    args: [user],
+  })) as bigint[];
+
+  if (!ids.length) return [];
+
+  const structs = await pc.multicall({
+    allowFailure: false,
+    contracts: ids.map((id) => ({
+      address: a.PolicyManager,
+      abi: PolicyABI.abi as any,
+      functionName: "policies",
+      args: [id],
+    })),
+  });
+
+  console.log("structs", structs)
+
+  return structs.map((r: any, i: number) => ({
+    policyId: ids[i],
+    policyholder: r.policyholder ?? r[1],
+    planType: _asNumber(r.planType ?? r[2]),
+    paymentType: _asNumber(r.paymentType ?? r[3]),
+    paymentToken: r.paymentToken ?? r[4],
+    coverageAmount: BigInt(r.coverageAmount ?? r[5]),
+    deductible: BigInt(r.deductible ?? r[6]),
+    premium: BigInt(r.premium ?? r[7]),
+    startDate: BigInt(r.startDate ?? r[8]),
+    endDate: BigInt(r.endDate ?? r[9]),
+    lastPaymentDate: BigInt(r.lastPaymentDate ?? r[10]),
+    status: _asNumber(r.status ?? r[11]),
+    ipfsMetadata: String(r.ipfsMetadata ?? r[12]),
+    totalPaid: BigInt(r.totalPaid ?? r[13]),
+    claimsUsed: BigInt(r.claimsUsed ?? r[14]),
+  }));
+}
+
+/** Claims are on ClaimManager */
+/** Fetch all claim IDs for a policy then hydrate each claim struct. */
+async function getPolicyClaims(
+  policyId: bigint,
+  pc: PublicClient | null | undefined
+): Promise<Claim[]> {
+  if (!pc) throw new Error("Public client not ready");
+  const chainId = _chainIdOverride ?? pc.chain?.id ?? 0;
+  const a = addrs(chainId);
+
+  const ids = (await pc.readContract({
+    address: a.ClaimManager,
+    abi: ClaimABI.abi as any,
+    functionName: "getPolicyClaims",
+    args: [policyId],
+  })) as bigint[];
+
+  if (!ids.length) return [];
+
+  const structs = await pc.multicall({
+    allowFailure: false,
+    contracts: ids.map((id) => ({
+      address: a.ClaimManager,
+      abi: ClaimABI.abi as any,
+      functionName: "claims",
+      args: [id],
+    })),
+  });
+
+  return structs.map((r: any, i: number) => ({
+    claimId: ids[i],
+    policyId: BigInt(r.policyId ?? r[1]),
+    claimant: r.claimant ?? r[2],
+    claimAmount: BigInt(r.claimAmount ?? r[3]),
+    approvedAmount: BigInt(r.approvedAmount ?? r[4]),
+    status: _asNumber(r.status ?? r[5]),
+    submissionDate: BigInt(r.submissionDate ?? r[6]),
+    processedDate: BigInt(r.processedDate ?? r[7]),
+    ipfsDocuments: String(r.ipfsDocuments ?? r[8]),
+    description: String(r.description ?? r[9]),
+  }));
+}
+
+/**
+ * Get totals + RiskPool balance for a given ERC20 `token`.
+ * If you keep a default token in config (e.g. USDC), pass nothing and we’ll use it.
+ */
+ async function getContractStats(
+  pc: PublicClient | null | undefined,
+  opts?: { token?: Address }
+): Promise<ContractStats> {
+  if (!pc) throw new Error("Public client not ready");
+
+  const chainId = _chainIdOverride ?? pc.chain?.id ?? 0;
+  const a = addrs(chainId);
+  const token = opts?.token ?? a.PremiumToken;
+
+  // ✅ args: [] is required for zero-arg functions
+  const [totalPolicies, totalClaims] = (await pc.multicall({
+    allowFailure: false,
+    contracts: [
+      {
+        address: a.PolicyManager as Address,
+        abi: PolicyABI.abi,
+        functionName: "getTotalPolicies",
+        args: [] as const,
+      },
+      {
+        address: a.ClaimManager as Address,
+        abi: ClaimABI.abi,
+        functionName: "getTotalClaims",
+        args: [] as const,
+      },
+    ] as const,
+  })) as [bigint, bigint];
+
+  let contractBalance = 0n;
+  if (token) {
+    contractBalance = (await pc.readContract({
+      address: token as Address,
+      abi: erc20Abi,
+      functionName: "balanceOf",
+      args: [a.RiskPool as Address],
+    })) as bigint;
   }
+
+  return { totalPolicies, totalClaims, contractBalance };
+}
+
+/** Internal: approve ERC20 if allowance < amount */
+async function _approveIfNeeded(params: {
+  token: Address;
+  owner: Address;
+  spender: Address;
+  amount: bigint;
+  walletClient: WalletClient;
+  publicClient: PublicClient;
+}) {
+  const { token, owner, spender, amount, walletClient, publicClient } = params;
+  const allowance = (await publicClient.readContract({
+    address: token,
+    abi: erc20Abi,
+    functionName: "allowance",
+    args: [owner, spender],
+  })) as bigint;
+
+  if (allowance >= amount) return;
+
+  const hash = await walletClient.writeContract({
+    address: token,
+    abi: erc20Abi,
+    functionName: "approve",
+    args: [spender, amount],
+    chain: publicClient.chain,
+    account: owner,
+  });
+  await publicClient.waitForTransactionReceipt({ hash });
+}
+
+/** Purchase a policy; returns tx hash. `paymentType` and `token` must match contract’s expectations. */
+/** Purchase (ERC20) — matches PolicyManager::purchasePolicy(planType,paymentType,token,ipfs) */
+async function purchasePolicy(
+  planType: number,
+  paymentType: number,
+  token: Address,
+  ipfsMetadata: string,
+  walletClient: WalletClient,
+  publicClient: PublicClient
+): Promise<{ success: boolean; txHash: `0x${string}` }> {
+  if (!walletClient?.account || !publicClient?.chain)
+    throw new Error("Wallet or chain not available");
+
+  const chainId = publicClient.chain.id;
+  const a = addrs(chainId);
+  const owner = walletClient.account.address as Address;
+
+  // figure out cost (one-time vs monthly)
+  const plan = await getInsurancePlan(publicClient, planType);
+  const required =
+    paymentType === 0 /* ONE_TIME */ ? plan.oneTimePrice : plan.monthlyPrice;
+
+  // ensure token approved for PolicyManager
+  await _approveIfNeeded({
+    token,
+    owner,
+    spender: a.PolicyManager,
+    amount: required,
+    walletClient,
+    publicClient,
+  });
+
+  // call purchasePolicy
+  const hash = await walletClient.writeContract({
+    address: a.PolicyManager,
+    abi: PolicyABI.abi as any,
+    functionName: "purchasePolicy",
+    args: [planType, paymentType, token, ipfsMetadata],
+    chain: publicClient.chain,
+    account: owner,
+  });
+
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  return { success: receipt.status === "success", txHash: hash };
+}
+
+/** Pay monthly premium (will use stored paymentToken) */
+async function payMonthlyPremium(
+  policyId: bigint,
+  walletClient: WalletClient,
+  publicClient: PublicClient
+): Promise<{ success: boolean; txHash: `0x${string}` }> {
+  if (!walletClient?.account || !publicClient?.chain)
+    throw new Error("Wallet or chain not available");
+
+  const chainId = publicClient.chain.id;
+  const a = addrs(chainId);
+  const owner = walletClient.account.address as Address;
+
+  // read policy + plan to compute required approval
+  const policy = await getPolicy(policyId, publicClient);
+  const plan = await getInsurancePlan(publicClient, policy.planType);
+  const required = plan.monthlyPrice;
+
+  await _approveIfNeeded({
+    token: policy.paymentToken,
+    owner,
+    spender: a.PolicyManager,
+    amount: required,
+    walletClient,
+    publicClient,
+  });
+
+  const hash = await walletClient.writeContract({
+    address: a.PolicyManager,
+    abi: PolicyABI.abi as any,
+    functionName: "payMonthlyPremium",
+    args: [policyId],
+    chain: publicClient.chain,
+    account: owner,
+  });
+
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  return { success: receipt.status === "success", txHash: hash };
+}
+
+/** Cancel a policy (msg.sender must be policyholder) */
+async function cancelPolicy(
+  policyId: bigint,
+  walletClient: WalletClient,
+  publicClient: PublicClient
+): Promise<{ success: boolean; txHash: `0x${string}` }> {
+  if (!walletClient?.account || !publicClient?.chain)
+    throw new Error("Wallet or chain not available");
+
+  const hash = await walletClient.writeContract({
+    address: addrs(publicClient.chain.id).PolicyManager,
+    abi: PolicyABI.abi as any,
+    functionName: "cancelPolicy",
+    args: [policyId],
+    chain: publicClient.chain,
+    account: walletClient.account.address as Address,
+  });
+
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  return { success: receipt.status === "success", txHash: hash };
+}
+
+/** Compute remaining coverage from on-chain policy struct */
+async function getRemainingCoverage(
+  policyId: bigint,
+  pc: PublicClient | null | undefined
+): Promise<bigint> {
+  const p = await getPolicy(policyId, pc);
+  const remaining = p.coverageAmount - p.claimsUsed;
+  return remaining < 0n ? 0n : remaining;
+}
+
+/** submit a claim via ClaimManager::submitClaim(policyId, amountWei, ipfs, description) */
+async function submitClaim(
+  policyId: bigint,
+  amountEth: string | number,
+  ipfsHash: string,
+  description: string,
+  walletClient: WalletClient,
+  publicClient: PublicClient
+): Promise<{ success: boolean; txHash: `0x${string}` }> {
+  if (!walletClient?.account || !publicClient?.chain)
+    throw new Error("Wallet or chain not available");
+
+  const a = addrs(publicClient.chain.id);
+  const account = walletClient.account.address;
+
+  const hash = await walletClient.writeContract({
+    address: a.ClaimManager,
+    abi: ClaimABI.abi as any,
+    functionName: "submitClaim",
+    args: [policyId, parseEther(String(amountEth)), ipfsHash, description],
+    chain: publicClient.chain,
+    account,
+  });
+
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  return { success: receipt.status === "success", txHash: hash };
+}
+
+/** process a claim via ClaimManager::processClaim(claimId, status, approvedAmountWei) */
+async function processClaim(
+  claimId: bigint,
+  status: number,
+  approvedAmountEth: string | number,
+  walletClient: WalletClient,
+  publicClient: PublicClient
+): Promise<{ success: boolean; txHash: `0x${string}` }> {
+  if (!walletClient?.account || !publicClient?.chain)
+    throw new Error("Wallet or chain not available");
+
+  const a = addrs(publicClient.chain.id);
+  const account = walletClient.account.address;
+
+  const hash = await walletClient.writeContract({
+    address: a.ClaimManager,
+    abi: ClaimABI.abi as any,
+    functionName: "processClaim",
+    args: [claimId, status, parseEther(String(approvedAmountEth ?? 0))],
+    chain: publicClient.chain,
+    account,
+  });
+
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  return { success: receipt.status === "success", txHash: hash };
+}
+
+/** Native CELO balance of the RiskPool */
+async function getRiskPoolNativeBalance(
+  pc: PublicClient | null | undefined
+): Promise<bigint> {
+  if (!pc) throw new Error("Public client not ready");
+  const a = addrs(_chainIdOverride ?? pc.chain?.id ?? 0);
+  return pc.getBalance({ address: a.RiskPool });
+}
+
+/** ERC20 balance of the RiskPool for a given token */
+async function getRiskPoolTokenBalance(
+  pc: PublicClient | null | undefined,
+  token: Address
+): Promise<bigint> {
+  if (!pc) throw new Error("Public client not ready");
+  const a = addrs(_chainIdOverride ?? pc.chain?.id ?? 0);
+  return pc.readContract({
+    address: token,
+    abi: erc20Abi,
+    functionName: "balanceOf",
+    args: [a.RiskPool],
+  }) as Promise<bigint>;
+}
+
+async function _write<
+  TAbi extends Abi,
+  TName extends ContractFunctionName<TAbi, "nonpayable" | "payable">
+>(params: {
+  address: Address;
+  abi: TAbi;
+  functionName: TName;
+  args: any[];
+  walletClient: WalletClient;
+  publicClient: PublicClient;
+}): Promise<{ success: boolean; txHash: `0x${string}` }> {
+  const { address, abi, functionName, args, walletClient, publicClient } = params;
+  const hash = await walletClient.writeContract({
+    address,
+    abi,
+    functionName,
+    args: args as any,            // ✅ avoid generic args inference explosion
+    chain: publicClient.chain,
+    account: walletClient.account // ✅ pass the Account, not just .address
+  } as any);
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  return { success: receipt.status === "success", txHash: hash };
 }
 
 
-async getAllInsurancePlans(provider) {
-  try {
-    const { pm } = this._getInstances(provider);
+/** NEW: list ALL claims (admin) using ClaimManager::_claimIdCounter via getTotalClaims() and multicall */
+async function getAllClaims(pc: PublicClient): Promise<Claim[]> {
+  const chainId = _chainIdOverride ?? pc.chain?.id ?? 0;
+  const a = addrs(chainId);
 
-    // Prefer a batch getter if it exists (any 0-arg function with a plural-ish name)
-    const batchNames = ["getAllPlans", "listPlans", "getPlans", "plans"]; // last one catches some array-returners
-    for (const name of batchNames) {
-      const frags = (pm?.interface?.fragments || [])
-        .filter(f => f.type === "function" && f.name === name && f.inputs?.length === 0);
-      for (const frag of frags) {
-        const key = frag.format(); // e.g. "getAllPlans()"
-        if (!pm[key]) continue;
-        try {
-          const list = await pm[key]();
-          if (Array.isArray(list) && list.length) {
-            return list.map((p, idx) => this._readPlanTuple(idx, p)).filter(Boolean);
-          }
-        } catch {}
-      }
-    }
+  // read how many claims exist
+  const total = (await pc.readContract({
+    address: a.ClaimManager,
+    abi: ClaimABI.abi as Abi,
+    functionName: "getTotalClaims",
+    args: [],
+  })) as bigint;
 
-    // Next best: if contract exposes a count, iterate 0..count-1
-    const count = await this._getPlanCount(pm);
-    if (Number.isFinite(count) && count > 0) {
-      const items = [];
-      for (let i = 0; i < count; i++) {
-        const one = await this.getInsurancePlan(i, provider);
-        if (one) items.push(one);
-      }
-      if (items.length) return items;
-    }
+  if (total === 0n) return [];
 
-    // Fallback: try your known enum values
-    const plans = await Promise.all([
-      this.getInsurancePlan(PLAN_TYPES.BASIC, provider),
-      this.getInsurancePlan(PLAN_TYPES.PREMIUM, provider),
-      this.getInsurancePlan(PLAN_TYPES.PLATINUM, provider),
-    ]);
-    return plans.filter(Boolean);
-  } catch (e) {
-    console.error("getAllInsurancePlans:", e);
-    return [];
-  }
-}
-
-
-  async getPolicy(policyId, provider) {
-    try {
-      const { pm } = this._getInstances(provider);
-      const p = await pm.policies(policyId);
-      return {
-        policyId: String(p.policyId ?? p[0]),
-        policyholder: p.policyholder ?? p[1],
-        planType: Number(p.planType ?? p[2]),
-        paymentType: Number(p.paymentType ?? p[3]),
-        paymentToken: p.paymentToken ?? p[4],
-        coverageAmount: fmt(p.coverageAmount ?? p[5]),
-        deductible: fmt(p.deductible ?? p[6]),
-        premium: fmt(p.premium ?? p[7]),
-        startDate: String(p.startDate ?? p[8]),
-        endDate: String(p.endDate ?? p[9]),
-        lastPaymentDate: String(p.lastPaymentDate ?? p[10]),
-        status: Number(p.status ?? p[11]),
-        ipfsMetadata: p.ipfsMetadata ?? p[12],
-        totalPaid: fmt(p.totalPaid ?? p[13]),
-        claimsUsed: fmt(p.claimsUsed ?? p[14]),
-      };
-    } catch (e) {
-      console.error("getPolicy:", e);
-      return null;
-    }
-  }
-
-  async getUserPolicies(user, provider) {
-    try {
-      const { pm } = this._getInstances(provider);
-      const ids = await pm.getUserPolicies(user);
-      const arr = Array.from(ids, (x) => (isV6 ? Number(x) : x.toNumber?.() ?? Number(x)));
-      const out = await Promise.all(arr.map((id) => this.getPolicy(id, provider)));
-      return out.filter(Boolean);
-    } catch (e) {
-      console.error("getUserPolicies:", e);
-      return [];
-    }
-  }
-
-  async isPolicyValid(policyId, provider) {
-    try {
-      const { pm } = this._getInstances(provider);
-      return await pm.isPolicyValid(policyId);
-    } catch {
-      return false;
-    }
-  }
-
-  async getRemainingCoverage(policyId, provider) {
-    try {
-      const { pm } = this._getInstances(provider);
-      const remaining = await pm.getRemainingCoverage(policyId);
-      return fmt(remaining);
-    } catch (e) {
-      console.error("getRemainingCoverage:", e);
-      return "0";
-    }
-  }
-
-  async getContractStats(provider) {
-    try {
-      const { pm, cm } = this._getInstances(provider);
-      const [pols, claims] = await Promise.all([pm.getTotalPolicies(), cm.getTotalClaims()]);
-      return {
-        totalPolicies: isV6 ? String(pols) : pols.toString(),
-        totalClaims: isV6 ? String(claims) : claims.toString(),
-      };
-    } catch (e) {
-      console.error("getContractStats:", e);
-      return { totalPolicies: "0", totalClaims: "0" };
-    }
-  }
-
-  /* ------------------------------ WRITES -------------------------------- */
-
-  async purchasePolicy(planType, paymentType, tokenAddress, ipfsMetadata, signer) {
-    try {
-      if (!isAddr(tokenAddress)) throw new Error("Invalid token address");
-      const { pm } = this._getInstances(signer, true);
-      const tx = await pm.purchasePolicy(planType, paymentType, tokenAddress, ipfsMetadata, {
-        gasLimit: 600_000,
+  // chunked multicalls so we don’t blow past size limits
+  const ids = Array.from({ length: Number(total) }, (_, i) => BigInt(i + 1));
+  const CHUNK = 250;
+  const out: Claim[] = [];
+  for (let i = 0; i < ids.length; i += CHUNK) {
+    const slice = ids.slice(i, i + CHUNK);
+    const structs = await pc.multicall({
+      allowFailure: false,
+      contracts: slice.map((id) => ({
+        address: a.ClaimManager,
+        abi: ClaimABI.abi as Abi,
+        functionName: "claims",
+        args: [id],
+      })),
+    });
+    for (let j = 0; j < slice.length; j++) {
+      const r: any = structs[j];
+      out.push({
+        claimId: slice[j],
+        policyId: BigInt(r.policyId ?? r[1]),
+        claimant: (r.claimant ?? r[2]) as Address,
+        claimAmount: BigInt(r.claimAmount ?? r[3]),
+        approvedAmount: BigInt(r.approvedAmount ?? r[4]),
+        status: Number(r.status ?? r[5]),
+        submissionDate: BigInt(r.submissionDate ?? r[6]),
+        processedDate: BigInt(r.processedDate ?? r[7]),
+        ipfsDocuments: String(r.ipfsDocuments ?? r[8]),
+        description: String(r.description ?? r[9]),
       });
-      toast.loading("Purchasing policy...", { id: "purchase" });
-      const receipt = await tx.wait();
-      toast.success("Policy purchased!", { id: "purchase" });
-      return { success: true, txHash: tx.hash, receipt };
-    } catch (error) {
-      console.error("purchasePolicy:", error);
-      toast.error(error.reason || error.message || "Failed to purchase", { id: "purchase" });
-      return { success: false, error: String(error?.reason || error?.message) };
+    }
+  }
+  return out;
+}
+
+/** NEW: scan DoctorAuthorized events and reduce to latest status per doctor */
+async function getAuthorizedDoctorsFromEvents(pc: PublicClient): Promise<
+  Array<{ address: Address; isAuthorized: boolean; blockNumber: bigint; txHash: `0x${string}` }>
+> {
+  const chainId = _chainIdOverride ?? pc.chain?.id ?? 0;
+  const a = addrs(chainId);
+
+  const eventItem = parseAbiItem(
+    "event DoctorAuthorized(address indexed doctor, bool authorized)"
+  );
+
+  const logs = await pc.getLogs({
+    address: a.ClaimManager,
+    event: eventItem,
+    fromBlock: 0n,
+    toBlock: "latest",
+  });
+
+  // reduce by doctor => last log
+  const map = new Map<Address, (typeof logs)[number]>();
+  for (const log of logs) {
+    const { args } = log;
+    const doctor = args.doctor as Address;
+    const prev = map.get(doctor);
+    if (!prev || (log.blockNumber ?? 0n) > (prev.blockNumber ?? 0n)) {
+      map.set(doctor, log);
     }
   }
 
-  async payMonthlyPremium(policyId, signer) {
-    try {
-      const { pm } = this._getInstances(signer, true);
-      const tx = await pm.payMonthlyPremium(policyId, { gasLimit: 300_000 });
-      toast.loading("Paying monthly premium...", { id: "premium" });
-      const receipt = await tx.wait();
-      toast.success("Premium paid!", { id: "premium" });
-      return { success: true, txHash: tx.hash, receipt };
-    } catch (error) {
-      console.error("payMonthlyPremium:", error);
-      toast.error(error.reason || error.message || "Failed to pay premium", { id: "premium" });
-      return { success: false, error: String(error?.reason || error?.message) };
-    }
-  }
+  return [...map.entries()].map(([addr, log]) => {
+    const decoded = decodeEventLog({
+      abi: [eventItem],
+      data: log.data,
+      topics: log.topics,
+    });
+    return {
+      address: addr,
+      isAuthorized: Boolean((decoded.args as any).authorized),
+      blockNumber: log.blockNumber!,
+      txHash: log.transactionHash!,
+    };
+  });
+}
 
-  async cancelPolicy(policyId, signer) {
-    try {
-      const { pm } = this._getInstances(signer, true);
-      const tx = await pm.cancelPolicy(policyId, { gasLimit: 200_000 });
-      toast.loading("Cancelling policy...", { id: "cancel" });
-      const r = await tx.wait();
-      toast.success("Policy cancelled", { id: "cancel" });
-      return { success: true, txHash: tx.hash, receipt: r };
-    } catch (e) {
-      console.error("cancelPolicy:", e);
-      toast.error(e.reason || e.message || "Failed to cancel", { id: "cancel" });
-      return { success: false, error: String(e?.reason || e?.message) };
-    }
-  }
+/* --- ADMIN: Pausable views --- */
+async function getPaused(
+  pc: PublicClient
+): Promise<{ policyManager: boolean; claimManager: boolean }> {
+  const chainId = _chainIdOverride ?? pc.chain?.id ?? 0;
+  const a = addrs(chainId);
 
-  async submitClaim(policyId, claimAmountEth, ipfsDocs, description, signer) {
-    try {
-      const { cm } = this._getInstances(signer, true);
-      const tx = await cm.submitClaim(policyId, parse(claimAmountEth), ipfsDocs, description, {
-        gasLimit: 400_000,
-      });
-      toast.loading("Submitting claim...", { id: "claim" });
-      const r = await tx.wait();
-      toast.success("Claim submitted!", { id: "claim" });
-      return { success: true, txHash: tx.hash, receipt: r };
-    } catch (e) {
-      console.error("submitClaim:", e);
-      toast.error(e.reason || e.message || "Failed to submit claim", { id: "claim" });
-      return { success: false, error: String(e?.reason || e?.message) };
-    }
-  }
+  const [pmPaused, cmPaused] = await pc.multicall({
+    allowFailure: false,
+    contracts: [
+      { address: a.PolicyManager, abi: PolicyABI.abi as Abi, functionName: "paused", args: [] },
+      { address: a.ClaimManager, abi: ClaimABI.abi as Abi, functionName: "paused", args: [] },
+    ],
+  });
+  return { policyManager: Boolean(pmPaused), claimManager: Boolean(cmPaused) };
+}
 
-  async processClaim(claimId, status, approvedAmountEth, signer) {
-    try {
-      const { cm } = this._getInstances(signer, true);
-      const amt = status === CLAIM_STATUS.APPROVED ? parse(approvedAmountEth) : parse("0");
-      const tx = await cm.processClaim(claimId, status, amt, { gasLimit: 600_000 });
-      toast.loading("Processing claim...", { id: "process" });
-      const r = await tx.wait();
-      toast.success("Claim processed!", { id: "process" });
-      return { success: true, txHash: tx.hash, receipt: r };
-    } catch (e) {
-      console.error("processClaim:", e);
-      toast.error(e.reason || e.message || "Failed to process claim", { id: "process" });
-      return { success: false, error: String(e?.reason || e?.message) };
-    }
-  }
+/* --- ADMIN: PolicyManager writes --- */
+async function pmPause(walletClient: WalletClient, publicClient: PublicClient) {
+  _requireClients(walletClient, publicClient);
+  const a = addrs(publicClient.chain!.id);
+  return _write({ address: a.PolicyManager, abi: PolicyABI.abi as Abi, functionName: "pause", args: [], walletClient, publicClient });
+}
 
-  async authorizeDoctorAddress(doctorAddress, authorized, signer) {
-    try {
-      if (!isAddr(doctorAddress)) throw new Error("Invalid address");
-      const { cm } = this._getInstances(signer, true);
-      const tx = await cm.authorizeDoctor(doctorAddress, authorized, { gasLimit: 120_000 });
-      toast.loading(authorized ? "Authorizing doctor..." : "Revoking doctor...", { id: "doctor-auth" });
-      const r = await tx.wait();
-      toast.success(authorized ? "Doctor authorized!" : "Doctor revoked!", { id: "doctor-auth" });
-      return { success: true, txHash: tx.hash, receipt: r };
-    } catch (e) {
-      console.error("authorizeDoctorAddress:", e);
-      toast.error(e.reason || e.message || "Failed to update doctor", { id: "doctor-auth" });
-      return { success: false, error: String(e?.reason || e?.message) };
-    }
-  }
+async function pmUnpause(walletClient: WalletClient, publicClient: PublicClient) {
+  _requireClients(walletClient, publicClient);
+  const a = addrs(publicClient.chain!.id);
+  return _write({ address: a.PolicyManager, abi: PolicyABI.abi as Abi, functionName: "unpause", args: [], walletClient, publicClient });
+}
 
-  async withdrawFromPool(tokenAddress, amountEth, to, signer) {
-    try {
-      const { pool } = this._getInstances(signer, true);
-      const tx = await pool.withdraw(need(tokenAddress, "token"), parse(amountEth), need(to, "to"));
-      toast.loading("Withdrawing from pool...", { id: "withdraw" });
-      const r = await tx.wait();
-      toast.success("Withdrawn!", { id: "withdraw" });
-      return { success: true, txHash: tx.hash, receipt: r };
-    } catch (e) {
-      console.error("withdrawFromPool:", e);
-      toast.error(e.reason || e.message || "Withdraw failed", { id: "withdraw" });
-      return { success: false, error: String(e?.reason || e?.message) };
-    }
-  }
+async function pmWhitelistToken(
+  token: Address,
+  enabled: boolean,
+  walletClient: WalletClient,
+  publicClient: PublicClient
+) {
+  _requireClients(walletClient, publicClient);
+  const a = addrs(publicClient.chain!.id);
+  return _write({
+    address: a.PolicyManager,
+    abi: PolicyABI.abi as Abi,
+    functionName: "whitelistToken",
+    args: [token, enabled],
+    walletClient,
+    publicClient,
+  });
+}
 
-  /* --------------------------- ERC20 utilities --------------------------- */
+async function pmUpdateInsurancePlan(
+  planType: number,
+  oneTimePrice: bigint,
+  monthlyPrice: bigint,
+  coverageAmount: bigint,
+  deductible: bigint,
+  walletClient: WalletClient,
+  publicClient: PublicClient
+) {
+  _requireClients(walletClient, publicClient);
+  const a = addrs(publicClient.chain!.id);
+  return _write({
+    address: a.PolicyManager,
+    abi: PolicyABI.abi as Abi,
+    functionName: "updateInsurancePlan",
+    args: [planType, oneTimePrice, monthlyPrice, coverageAmount, deductible],
+    walletClient,
+    publicClient,
+  });
+}
 
-  token(tokenAddr, signerOrProvider) {
-    return new ethers.Contract(need(tokenAddr, "token"), ABI_ERC20, signerOrProvider);
-  }
-  async tokenAllowance(tokenAddr, owner, spender, provider) {
-    const erc = this.token(tokenAddr, provider);
-    const v = await erc.allowance(owner, spender);
-    return fmt(v);
-  }
-  async tokenApprove(tokenAddr, spender, amountEth, signer) {
-    try {
-      const erc = this.token(tokenAddr, signer);
-      const tx = await erc.approve(need(spender, "spender"), parse(amountEth));
-      toast.loading("Approving token...", { id: "approve" });
-      const r = await tx.wait();
-      toast.success("Approved!", { id: "approve" });
-      return { success: true, txHash: tx.hash, receipt: r };
-    } catch (e) {
-      console.error("tokenApprove:", e);
-      toast.error(e.reason || e.message || "Approve failed", { id: "approve" });
-      return { success: false, error: String(e?.reason || e?.message) };
-    }
-  }
-  async tokenBalance(tokenAddr, account, provider) {
-    const erc = this.token(tokenAddr, provider);
-    const v = await erc.balanceOf(account);
-    return fmt(v);
-  }
+async function pmUpdatePlanMetadata(
+  planType: number,
+  ipfsHash: string,
+  walletClient: WalletClient,
+  publicClient: PublicClient
+) {
+  _requireClients(walletClient, publicClient);
+  const a = addrs(publicClient.chain!.id);
+  return _write({
+    address: a.PolicyManager,
+    abi: PolicyABI.abi as Abi,
+    functionName: "updatePlanMetadata",
+    args: [planType, ipfsHash],
+    walletClient,
+    publicClient,
+  });
+}
 
-  /* ----------------------------- Claims list ----------------------------- */
+async function pmSetRiskPool(
+  riskPool: Address,
+  walletClient: WalletClient,
+  publicClient: PublicClient
+) {
+  _requireClients(walletClient, publicClient);
+  const a = addrs(publicClient.chain!.id);
+  return _write({
+    address: a.PolicyManager,
+    abi: PolicyABI.abi as Abi,
+    functionName: "setRiskPool",
+    args: [riskPool],
+    walletClient,
+    publicClient,
+  });
+}
 
-  async getClaim(claimId, provider) {
-    try {
-      const { cm } = this._getInstances(provider);
-      const c = await cm.claims(claimId);
-      return {
-        claimId: String(c.claimId ?? c[0]),
-        policyId: String(c.policyId ?? c[1]),
-        claimant: c.claimant ?? c[2],
-        claimAmount: fmt(c.claimAmount ?? c[3]),
-        approvedAmount: fmt(c.approvedAmount ?? c[4]),
-        status: Number(c.status ?? c[5]),
-        submissionDate: String(c.submissionDate ?? c[6]),
-        processedDate: String(c.processedDate ?? c[7]),
-        ipfsDocuments: c.ipfsDocuments ?? c[8],
-        description: c.description ?? c[9],
-      };
-    } catch (e) {
-      console.error("getClaim:", e);
-      return null;
-    }
-  }
+async function pmSetClaimManager(
+  claimManager: Address,
+  walletClient: WalletClient,
+  publicClient: PublicClient
+) {
+  _requireClients(walletClient, publicClient);
+  const a = addrs(publicClient.chain!.id);
+  return _write({
+    address: a.PolicyManager,
+    abi: PolicyABI.abi as Abi,
+    functionName: "setClaimManager",
+    args: [claimManager],
+    walletClient,
+    publicClient,
+  });
+}
 
-  async getPolicyClaims(policyId, provider) {
-    try {
-      const { cm } = this._getInstances(provider);
-      const ids = await cm.getPolicyClaims(policyId);
-      const arr = Array.from(ids, (x) => (isV6 ? Number(x) : x.toNumber?.() ?? Number(x)));
-      const list = await Promise.all(arr.map((id) => this.getClaim(id, provider)));
-      return list.filter(Boolean);
-    } catch (e) {
-      console.error("getPolicyClaims:", e);
-      return [];
-    }
-  }
+/* --- ADMIN: ClaimManager writes --- */
+async function cmPause(walletClient: WalletClient, publicClient: PublicClient) {
+  _requireClients(walletClient, publicClient);
+  const a = addrs(publicClient.chain!.id);
+  return _write({ address: a.ClaimManager, abi: ClaimABI.abi as Abi, functionName: "pause", args: [], walletClient, publicClient });
+}
 
-  async fetchAllClaims(provider) {
-    try {
-      const { cm, pm } = this._getInstances(provider);
-      const total = await cm.getTotalClaims();
-      const n = isV6 ? Number(total) : total.toNumber?.() ?? Number(total);
-      const out = [];
-      for (let i = 1; i <= n; i++) {
-        try {
-          const c = await this.getClaim(i, provider);
-          if (!c) continue;
-          const p = await pm.policies(c.policyId);
-          out.push({
-            ...c,
-            policyholder: p.policyholder ?? p[1],
-            planType: Number(p.planType ?? p[2]),
-            providerName: this.getPlanTypeName(Number(p.planType ?? p[2])),
-            claimType: this.deriveClaimType(c.description || ""),
-            submissionDate: Number(c.submissionDate) * 1000,
-            processedDate: Number(c.processedDate) * 1000,
-          });
-        } catch (e) {
-          console.warn(`claim ${i} read failed`, e);
-        }
-      }
-      return { success: true, claims: out };
-    } catch (e) {
-      console.error("fetchAllClaims:", e);
-      return { success: false, claims: [], error: String(e?.message || e) };
-    }
-  }
+async function cmUnpause(walletClient: WalletClient, publicClient: PublicClient) {
+  _requireClients(walletClient, publicClient);
+  const a = addrs(publicClient.chain!.id);
+  return _write({ address: a.ClaimManager, abi: ClaimABI.abi as Abi, functionName: "unpause", args: [], walletClient, publicClient });
+}
 
-  async fetchClaimsWithEvents(provider, fromBlock = 0) {
-    try {
-      const { cm, pm } = this._getInstances(provider);
-      const evSub = cm.filters.ClaimSubmitted();
-      const evPro = cm.filters.ClaimProcessed();
-      const [sub, pro] = await Promise.all([cm.queryFilter(evSub, fromBlock), cm.queryFilter(evPro, fromBlock)]);
-      const ids = [...new Set([...sub, ...pro].map((e) => String(e.args.claimId)))];
-      const claims = [];
-      for (const id of ids) {
-        const c = await this.getClaim(id, provider);
-        if (!c) continue;
-        const p = await pm.policies(c.policyId);
-        claims.push({
-          ...c,
-          policyholder: p.policyholder ?? p[1],
-          planType: Number(p.planType ?? p[2]),
-          providerName: this.getPlanTypeName(Number(p.planType ?? p[2])),
-          claimType: this.deriveClaimType(c.description || ""),
-          submissionDate: Number(c.submissionDate) * 1000,
-          processedDate: Number(c.processedDate) * 1000,
-        });
-      }
-      return { success: true, claims };
-    } catch (e) {
-      console.error("fetchClaimsWithEvents:", e);
-      return { success: false, claims: [], error: String(e?.message || e) };
-    }
-  }
+async function cmAuthorizeDoctor(
+  doctor: Address,
+  ok: boolean,
+  walletClient: WalletClient,
+  publicClient: PublicClient
+) {
+  _requireClients(walletClient, publicClient);
+  const a = addrs(publicClient.chain!.id);
+  return _write({
+    address: a.ClaimManager,
+    abi: ClaimABI.abi as Abi,
+    functionName: "authorizeDoctor",
+    args: [doctor, ok],
+    walletClient,
+    publicClient,
+  });
+}
 
-  /* ------------------------------ helpers -------------------------------- */
+async function cmSetManagers(
+  policyManager: Address,
+  riskPool: Address,
+  walletClient: WalletClient,
+  publicClient: PublicClient
+) {
+  _requireClients(walletClient, publicClient);
+  const a = addrs(publicClient.chain!.id);
+  return _write({
+    address: a.ClaimManager,
+    abi: ClaimABI.abi as Abi,
+    functionName: "setManagers",
+    args: [policyManager, riskPool],
+    walletClient,
+    publicClient,
+  });
+}
 
-  getPlanTypeName(planType) {
-    return { 0: "Basic Plan", 1: "Premium Plan", 2: "Platinum Plan" }[planType] || "Unknown Plan";
-  }
-  deriveClaimType(description = "") {
-    const d = description.toLowerCase();
-    if (d.includes("emergency") || d.includes("urgent")) return "emergency";
-    if (d.includes("surgery") || d.includes("operation")) return "surgery";
-    if (d.includes("pharmacy") || d.includes("medicine") || d.includes("drug")) return "pharmacy";
-    if (d.includes("dental") || d.includes("tooth")) return "dental";
-    if (d.includes("vision") || d.includes("eye") || d.includes("glasses")) return "vision";
-    return "general";
-  }
+/* --- OPTIONAL: RiskPool admin (wire after you confirm ABI) ---
+   If your RiskPoolTreasury has e.g. `withdrawToken(address token,address to,uint256 amount)`,
+   add a wrapper like this and replace `functionName` & args to match your ABI exactly. */
 
-    /** Back-compat: return a specific contract instance.
-   *  target: "claim" (default) | "pm" | "policy" | "pool" | "core"
-   *  withSigner: true => expects a Signer (for writes)
-   */
-  initContract(signerOrProvider, withSigner = false, target = "claim") {
-    const { pm, cm, pool, core } = this._getInstances(signerOrProvider, withSigner);
-    switch ((target || "claim").toLowerCase()) {
-      case "pm":
-      case "policy": return pm;
-      case "pool":   return pool;
-      case "core":   return core;
-      default:       return cm;   // ClaimManager
-    }
-  }
+async function riskPoolWithdrawToken(
+  token: Address,
+  to: Address,
+  amount: bigint,
+  walletClient: WalletClient,
+  publicClient: PublicClient
+) {
+  _requireClients(walletClient, publicClient);
+  const a = addrs(publicClient.chain!.id);
+  return _write({
+    address: a.RiskPool,
+    abi: RiskPoolABI.abi as Abi,
+    functionName: "withdrawToken", // <-- rename to your actual function
+    args: [token, to, amount],
+    walletClient,
+    publicClient,
+  });
+}
 
-  // Optional sugar (used below)
-  getClaimManager(rw) { return this.initContract(rw, !!ethers.Signer?.isSigner?.(rw), "claim"); }
-  getPolicyManager(rw) { return this.initContract(rw, !!ethers.Signer?.isSigner?.(rw), "pm"); }
-  getCoreProtocol (rw) { return this.initContract(rw, !!ethers.Signer?.isSigner?.(rw), "core"); }
-
-  /** Writers used by PlanManagement */
-  async updateInsurancePlan(planType, oneTime, monthly, coverage, deductible, signer) {
-    const pm = this.getPolicyManager(signer);
-    // Try to support several common function names/signatures
-    const toWei = (x) => (ethers.utils ? ethers.utils.parseEther(String(x)) : ethers.parseEther(String(x)));
-    try {
-      if (pm.updateInsurancePlan) {
-        return await (await pm.updateInsurancePlan(
-          planType, toWei(oneTime || "0"), toWei(monthly), toWei(coverage), toWei(deductible)
-        )).wait(), { success: true };
-      }
-      if (pm.setInsurancePlan) {
-        return await (await pm.setInsurancePlan(
-          planType, toWei(oneTime || "0"), toWei(monthly), toWei(coverage), toWei(deductible)
-        )).wait(), { success: true };
-      }
-      throw new Error("PolicyManager: update plan function not found");
-    } catch (e) {
-      console.error("updateInsurancePlan:", e);
-      return { success: false, error: String(e?.reason || e?.message || e) };
-    }
-  }
-
-  async updatePlanMetadata(planType, ipfsHash, signer) {
-    const pm = this.getPolicyManager(signer);
-    try {
-      if (pm.setPlanMetadata) {
-        return await (await pm.setPlanMetadata(planType, ipfsHash)).wait(), { success: true };
-      }
-      if (pm.updatePlanMetadata) {
-        return await (await pm.updatePlanMetadata(planType, ipfsHash)).wait(), { success: true };
-      }
-      throw new Error("PolicyManager: metadata function not found");
-    } catch (e) {
-      console.error("updatePlanMetadata:", e);
-      return { success: false, error: String(e?.reason || e?.message || e) };
-    }
-  }
-
-  /* ——— list all function signatures on the PolicyManager ABI (handy for debugging) ——— */
-_listFunctionSigs(contract) {
+/** Convenience: format a wei bigint nicely (assumes 18 decimals). */
+function formatWei(x: bigint) {
   try {
-    return (contract?.interface?.fragments || [])
-      .filter(f => f.type === "function")
-      .map(f => f.format());
-  } catch { return []; }
-}
-
-/* ——— find callable signatures by base names, preserving your preference order ——— */
-_findGetterKeys(pm, baseNames = []) {
-  const frags = (pm?.interface?.fragments || [])
-    .filter(f => f.type === "function" && f.inputs?.length === 1)
-    .filter(f => baseNames.includes((f.name || "").toLowerCase()));
-
-  // Sort to respect the provided preference (first name wins)
-  const order = name => baseNames.indexOf((name || "").toLowerCase());
-  frags.sort((a, b) => order(a.name) - order(b.name));
-
-  // Turn fragments into exact call keys, e.g. "getPlan(uint8)"
-  return frags.map(f => `${f.name}(${f.inputs.map(i => i.type).join(",")})`);
-}
-
-/* ——— best-effort count of plans if contract exposes it ——— */
-async _getPlanCount(pm) {
-  const candidates = ["getPlanCount", "planCount", "totalPlans"];
-  for (const name of candidates) {
-    // try exact name and all overload signatures with 0 inputs
-    const zeroArgFrags = (pm?.interface?.fragments || [])
-      .filter(f => f.type === "function" && f.name === name && f.inputs?.length === 0);
-    for (const frag of zeroArgFrags) {
-      const key = frag.format(); // e.g. "getPlanCount()"
-      try {
-        const n = await pm[key]();
-        const num = Number(n?.toString?.() ?? n);
-        if (Number.isFinite(num) && num >= 0) return num;
-      } catch {}
-    }
+    return formatEther(x);
+  } catch {
+    return x.toString();
   }
-  return null;
 }
 
-}
-
-export const contractService = new ContractService();
+/** Exported singleton */
+export const contractService = {
+  isOwner,
+  isAuthorizedDoctor,
+  setChainId,
+  // reads
+  getTokenMeta,
+  getInsurancePlan,
+  getAllInsurancePlans,
+  isTokenAccepted,
+  getPolicy,
+  getUserPolicies,
+  getPolicyClaims,
+  getContractStats,
+  getRemainingCoverage,
+  getRiskPoolNativeBalance,
+  getRiskPoolTokenBalance,
+  getAllClaims,
+  getAuthorizedDoctorsFromEvents,
+  getPaused,
+  // writes (user)
+  purchasePolicy,
+  payMonthlyPremium,
+  cancelPolicy,
+  submitClaim,
+  processClaim,
+  // writes (admin)
+  pmPause, 
+  pmUnpause,
+  pmWhitelistToken,
+  pmUpdateInsurancePlan,
+  pmUpdatePlanMetadata,
+  pmSetRiskPool,
+  pmSetClaimManager,
+  cmPause, 
+  cmUnpause,
+  cmAuthorizeDoctor,
+  cmSetManagers,
+  riskPoolWithdrawToken,  // uncomment when ABI confirmed
+  // utils
+  formatWei,
+};
